@@ -263,6 +263,7 @@ def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
         "messages": messages,
         "tools": tools,
         "stream": stream,
+        "options": {"num_ctx": 65536},
     }).encode()
 
     req = urllib.request.Request(
