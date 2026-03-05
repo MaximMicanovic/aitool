@@ -7,6 +7,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 import urllib.request
 import urllib.error
 
@@ -77,6 +79,39 @@ def c(color, text):
     return text
 
 
+class Spinner:
+    _frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, label="Thinking"):
+        self._label = label
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+
+    def _spin(self):
+        if not sys.stdout.isatty():
+            return
+        i = 0
+        while not self._stop.is_set():
+            frame = self._frames[i % len(self._frames)]
+            print(f"\r{c('dim', frame + ' ' + self._label + '...')}", end="", flush=True)
+            i += 1
+            time.sleep(0.08)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        if not self._stop.is_set():
+            self._stop.set()
+            self._thread.join()
+            if sys.stdout.isatty():
+                print("\r\033[K", end="", flush=True)
+
+    def __exit__(self, *_):
+        self.stop()
+
+
 def _strip_think(text):
     """Remove <think>...</think> blocks (qwen3 thinking mode)."""
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -87,11 +122,11 @@ def run_bash(command, confirm=False):
         print(c("yellow", "\nCommand to run:"))
         print(c("bold", f"  {command}"))
         try:
-            answer = input(c("yellow", "Run? [y/N] ")).strip().lower()
+            answer = input(c("yellow", "Run? [Y/n] ")).strip().lower()
         except (KeyboardInterrupt, EOFError):
             print()
             return "[Cancelled by user]"
-        if answer not in ("y", "yes"):
+        if answer in ("n", "no"):
             return "[Command cancelled by user]"
 
     try:
@@ -141,7 +176,7 @@ def handle_tool_call(tool_call):
     return result
 
 
-def chat_request(host, model, messages, tools, stream=True):
+def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
     """Returns (content, tool_calls, assistant_message) or (None, None, None) on error."""
     url = f"{host}/api/chat"
     payload = json.dumps({
@@ -212,6 +247,8 @@ def chat_request(host, model, messages, tools, stream=True):
 
                         if out:
                             if not prefix_printed:
+                                if stop_spinner:
+                                    stop_spinner()
                                 print(c("green", "AI: "), end="", flush=True)
                                 prefix_printed = True
                             print(out, end="", flush=True)
@@ -238,15 +275,14 @@ def chat_request(host, model, messages, tools, stream=True):
                         seen.add(key)
                         unique_tool_calls.append(tc)
 
-                if not prefix_printed and not unique_tool_calls:
-                    print(c("yellow", "AI: (no response — try a model that supports tools, e.g. qwen3:4b)"))
+                failed_tool = not prefix_printed and not unique_tool_calls
 
                 display_content = _strip_think(full_content)
                 content = final_message.get("content", "") or full_content
                 assistant_msg = {"role": "assistant", "content": content}
                 if unique_tool_calls:
                     assistant_msg["tool_calls"] = unique_tool_calls
-                return display_content, unique_tool_calls, assistant_msg
+                return display_content, unique_tool_calls, assistant_msg, failed_tool
             else:
                 data = json.loads(resp.read().decode())
                 msg = data["message"]
@@ -254,14 +290,13 @@ def chat_request(host, model, messages, tools, stream=True):
                 display = _strip_think(msg.get("content", ""))
                 if display:
                     print(c("green", "AI: ") + display)
-                elif not tool_calls:
-                    print(c("yellow", "AI: (no response — try a model that supports tools, e.g. qwen3:4b)"))
-                return display, tool_calls, msg
+                failed_tool = not display and not tool_calls
+                return display, tool_calls, msg, failed_tool
 
     except urllib.error.URLError as e:
         print(c("red", f"\nError connecting to Ollama at {host}: {e}"))
         print(c("dim", "Is Ollama running? Try: ollama serve"))
-        return None, None, None
+        return None, None, None, False
 
 
 def list_models(host):
@@ -273,12 +308,18 @@ def list_models(host):
         return []
 
 
-def chat_loop(model, system_prompt, host, stream):
+def chat_loop(model, system_prompt, host, stream, preload_messages=None):
     cwd = os.getcwd()
     system_parts = [f"Working directory: {cwd}"]
     if system_prompt:
         system_parts.append(system_prompt)
-    messages = [{"role": "system", "content": "\n".join(system_parts)}]
+    if preload_messages:
+        messages = preload_messages
+        # Update the system message cwd to current
+        if messages and messages[0]["role"] == "system":
+            messages[0]["content"] = "\n".join(system_parts)
+    else:
+        messages = [{"role": "system", "content": "\n".join(system_parts)}]
 
     print(c("bold", "ai") + c("dim", f" [{model}] ") + c("dim", cwd))
     if system_prompt:
@@ -340,12 +381,37 @@ def chat_loop(model, system_prompt, host, stream):
                     content = msg.get("content") or "[tool calls]"
                     print(c(role_color, f"{label}: ") + content)
 
+            elif cmd == "/save":
+                filename = arg or "ai-context.json"
+                try:
+                    with open(filename, "w") as f:
+                        json.dump({"model": model, "messages": messages}, f, indent=2)
+                    print(c("dim", f"Context saved to: {filename}"))
+                except Exception as e:
+                    print(c("red", f"Failed to save: {e}"))
+
+            elif cmd == "/load":
+                if not arg:
+                    print(c("yellow", "Usage: /load <filename>"))
+                else:
+                    try:
+                        with open(arg) as f:
+                            data = json.load(f)
+                        messages = data["messages"]
+                        if "model" in data:
+                            model = data["model"]
+                        print(c("dim", f"Context loaded from: {arg} (model: {model}, {len(messages)} messages)"))
+                    except Exception as e:
+                        print(c("red", f"Failed to load: {e}"))
+
             elif cmd == "/help":
                 print(c("bold", "Commands:"))
                 print("  /clear            Clear conversation history")
                 print("  /model [name]     Show or set the active model")
                 print("  /system [text]    Show or set the system prompt")
                 print("  /history          Print conversation history")
+                print("  /save [file]      Save context to file (default: ai-context.json)")
+                print("  /load <file>      Load context from file")
                 print("  /exit             Quit")
                 print()
                 print(c("bold", "Tools available to the AI:"))
@@ -361,9 +427,11 @@ def chat_loop(model, system_prompt, host, stream):
 
         # Agentic loop: keep going while the model is calling tools
         while True:
-            content, tool_calls, assistant_msg = chat_request(
-                host, model, messages, tools=TOOLS, stream=stream
-            )
+            with Spinner() as spinner:
+                content, tool_calls, assistant_msg, failed_tool = chat_request(
+                    host, model, messages, tools=TOOLS, stream=stream,
+                    stop_spinner=spinner.stop,
+                )
 
             if assistant_msg is None:
                 # Connection error — remove the user message we just added
@@ -372,6 +440,13 @@ def chat_loop(model, system_prompt, host, stream):
                 break
 
             messages.append(assistant_msg)
+
+            if failed_tool:
+                messages.append({
+                    "role": "user",
+                    "content": "It seems you didn't produce a response. Please continue.",
+                })
+                continue
 
             if not tool_calls:
                 break
@@ -402,7 +477,7 @@ Examples:
     )
     parser.add_argument(
         "-m", "--model",
-        default=os.environ.get("OLLAMA_MODEL", ""),
+        default=os.environ.get("OLLAMA_MODEL", "qwen3.5:9b-q8_0"),
         help="Model to use (or set OLLAMA_MODEL env var)",
     )
     parser.add_argument(
@@ -425,6 +500,11 @@ Examples:
         action="store_true",
         help="List available models and exit",
     )
+    parser.add_argument(
+        "-l", "--load",
+        metavar="FILE",
+        help="Load a saved context file to resume a previous session",
+    )
 
     args = parser.parse_args()
 
@@ -438,21 +518,24 @@ Examples:
             print(c("yellow", f"No models found or couldn't connect to {args.host}"))
         return
 
-    if not args.model:
-        models = list_models(args.host)
-        if not models:
-            print(c("red", f"Error: No model specified and couldn't connect to Ollama at {args.host}"))
-            print(c("dim", "Set OLLAMA_MODEL env var, use -m <model>, or check that Ollama is running."))
-            sys.exit(1)
-        args.model = models[0]
-        print(c("dim", f"No model specified, using: {args.model}"))
-        print(c("dim", "Use -m <model> or set OLLAMA_MODEL to choose a different one.\n"))
+    preload_messages = None
+    if args.load:
+        try:
+            with open(args.load) as f:
+                data = json.load(f)
+            preload_messages = data.get("messages")
+            if not args.model and "model" in data:
+                args.model = data["model"]
+            print(c("dim", f"Resuming context from: {args.load}"))
+        except Exception as e:
+            print(c("red", f"Failed to load context: {e}"))
 
     chat_loop(
         model=args.model,
         system_prompt=args.system,
         host=args.host,
         stream=not args.no_stream,
+        preload_messages=preload_messages,
     )
 
 
