@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""ai - Interactive chat tool powered by Ollama"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+
+DEFAULT_HOST = "http://localhost:11434"
+
+COLORS = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "cyan": "\033[36m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "red": "\033[31m",
+    "magenta": "\033[35m",
+}
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_read",
+            "description": (
+                "Run a read-only bash command that does NOT modify any files or system state. "
+                "Use for reading files (cat, head, tail), listing directories (ls, find, tree), "
+                "searching (grep, rg), checking status (git status, git log, ps, df, du), "
+                "printing environment (env, echo, pwd), etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The read-only bash command to run",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": (
+                "Run a bash command that may modify files or system state. "
+                "Use for writing/editing/deleting files, creating directories, "
+                "installing packages, running scripts, git commits, etc. "
+                "The user will be asked to confirm before the command runs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The bash command to run",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
+]
+
+
+def c(color, text):
+    if sys.stdout.isatty():
+        return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
+    return text
+
+
+def run_bash(command, confirm=False):
+    if confirm:
+        print(c("yellow", "\nCommand to run:"))
+        print(c("bold", f"  {command}"))
+        try:
+            answer = input(c("yellow", "Run? [y/N] ")).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return "[Cancelled by user]"
+        if answer not in ("y", "yes"):
+            return "[Command cancelled by user]"
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        output = result.stdout
+        if result.stderr:
+            output += result.stderr if not output else f"\n[stderr]:\n{result.stderr}"
+        if result.returncode != 0:
+            output += f"\n[exit code {result.returncode}]"
+        return output.strip() or "(no output)"
+    except subprocess.TimeoutExpired:
+        return "[Timed out after 60 seconds]"
+    except Exception as e:
+        return f"[Error: {e}]"
+
+
+def handle_tool_call(tool_call):
+    name = tool_call["function"]["name"]
+    args = tool_call["function"].get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    command = args.get("command", "")
+
+    if name == "bash_read":
+        print(c("dim", "  [read] ") + c("bold", command))
+        result = run_bash(command, confirm=False)
+    elif name == "bash":
+        result = run_bash(command, confirm=True)
+    else:
+        result = f"[Unknown tool: {name}]"
+
+    lines = result.splitlines()
+    preview = "\n".join(f"  {l}" for l in lines[:20])
+    if len(lines) > 20:
+        preview += f"\n  ... ({len(lines) - 20} more lines)"
+    print(c("dim", preview))
+    print()
+    return result
+
+
+def chat_request(host, model, messages, tools, stream=True):
+    """Returns (content, tool_calls, assistant_message) or (None, None, None) on error."""
+    url = f"{host}/api/chat"
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "stream": stream,
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            if stream:
+                full_content = ""
+                final_message = {}
+                prefix_printed = False
+                for line in resp:
+                    if not line:
+                        continue
+                    chunk = json.loads(line.decode())
+                    content = chunk.get("message", {}).get("content", "")
+                    if content:
+                        if not prefix_printed:
+                            print(c("green", "AI: "), end="", flush=True)
+                            prefix_printed = True
+                        print(content, end="", flush=True)
+                        full_content += content
+                    if chunk.get("done"):
+                        final_message = chunk.get("message", {})
+                        break
+
+                tool_calls = final_message.get("tool_calls", [])
+                if full_content:
+                    print()  # newline after streamed text
+
+                content = final_message.get("content", "") or full_content
+                assistant_msg = {"role": "assistant", "content": content}
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                return content, tool_calls, assistant_msg
+            else:
+                data = json.loads(resp.read().decode())
+                msg = data["message"]
+                tool_calls = msg.get("tool_calls", [])
+                if msg.get("content"):
+                    print(c("green", "AI: ") + msg["content"])
+                return msg.get("content", ""), tool_calls, msg
+
+    except urllib.error.URLError as e:
+        print(c("red", f"\nError connecting to Ollama at {host}: {e}"))
+        print(c("dim", "Is Ollama running? Try: ollama serve"))
+        return None, None, None
+
+
+def list_models(host):
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags") as resp:
+            data = json.loads(resp.read().decode())
+            return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
+def chat_loop(model, system_prompt, host, stream):
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    print(c("bold", "ai") + c("dim", f" [{model}]"))
+    if system_prompt:
+        preview = system_prompt[:60] + ("..." if len(system_prompt) > 60 else "")
+        print(c("dim", f"System: {preview}"))
+    print(c("dim", "Type /help for commands, Ctrl+C or /exit to quit\n"))
+
+    while True:
+        try:
+            user_input = input(c("cyan", "You: ")).strip()
+        except (KeyboardInterrupt, EOFError):
+            print(c("dim", "\nBye!"))
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.startswith("/"):
+            parts = user_input.split(None, 1)
+            cmd = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
+
+            if cmd in ("/exit", "/quit", "/bye"):
+                print(c("dim", "Bye!"))
+                break
+
+            elif cmd == "/clear":
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                print(c("dim", "Conversation cleared."))
+
+            elif cmd == "/model":
+                if arg:
+                    model = arg
+                    print(c("dim", f"Model set to: {model}"))
+                else:
+                    available = list_models(host)
+                    print(c("dim", f"Current model: {model}"))
+                    if available:
+                        print(c("dim", "Available: " + ", ".join(available)))
+
+            elif cmd == "/system":
+                if arg:
+                    system_prompt = arg
+                    messages = [m for m in messages if m["role"] != "system"]
+                    messages.insert(0, {"role": "system", "content": system_prompt})
+                    print(c("dim", "System prompt updated."))
+                else:
+                    print(c("dim", f"System prompt: {system_prompt or '(none)'}"))
+
+            elif cmd == "/history":
+                for msg in messages:
+                    if msg["role"] == "system":
+                        continue
+                    role_color = "cyan" if msg["role"] == "user" else "green"
+                    label = msg["role"].title()
+                    content = msg.get("content") or "[tool calls]"
+                    print(c(role_color, f"{label}: ") + content)
+
+            elif cmd == "/help":
+                print(c("bold", "Commands:"))
+                print("  /clear            Clear conversation history")
+                print("  /model [name]     Show or set the active model")
+                print("  /system [text]    Show or set the system prompt")
+                print("  /history          Print conversation history")
+                print("  /exit             Quit")
+                print()
+                print(c("bold", "Tools available to the AI:"))
+                print("  bash_read         Read-only commands — run automatically")
+                print("  bash              Commands that change things — asks you first")
+
+            else:
+                print(c("yellow", f"Unknown command: {cmd}. Type /help for help."))
+
+            continue
+
+        messages.append({"role": "user", "content": user_input})
+
+        # Agentic loop: keep going while the model is calling tools
+        while True:
+            content, tool_calls, assistant_msg = chat_request(
+                host, model, messages, tools=TOOLS, stream=stream
+            )
+
+            if assistant_msg is None:
+                # Connection error — remove the user message we just added
+                if messages and messages[-1]["role"] == "user":
+                    messages.pop()
+                break
+
+            messages.append(assistant_msg)
+
+            if not tool_calls:
+                break
+
+            print()  # blank line before tool output
+            for tool_call in tool_calls:
+                result = handle_tool_call(tool_call)
+                messages.append({"role": "tool", "content": result})
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Interactive AI chat powered by Ollama",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Environment variables:
+  OLLAMA_MODEL   Default model to use
+  OLLAMA_HOST    Ollama server URL (default: http://localhost:11434)
+  OLLAMA_SYSTEM  Default system prompt
+
+Examples:
+  ai                                    Start chat (auto-picks first available model)
+  ai -m llama3.2                        Use a specific model
+  ai -s "You are a Linux expert"        Set a system prompt
+  ai --list                             List available models
+  OLLAMA_MODEL=mistral ai               Set model via env var
+""",
+    )
+    parser.add_argument(
+        "-m", "--model",
+        default=os.environ.get("OLLAMA_MODEL", ""),
+        help="Model to use (or set OLLAMA_MODEL env var)",
+    )
+    parser.add_argument(
+        "-s", "--system",
+        default=os.environ.get("OLLAMA_SYSTEM", ""),
+        help="System prompt (or set OLLAMA_SYSTEM env var)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("OLLAMA_HOST", DEFAULT_HOST),
+        help="Ollama host URL (default: http://localhost:11434)",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable streaming output",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List available models and exit",
+    )
+
+    args = parser.parse_args()
+
+    if args.list:
+        models = list_models(args.host)
+        if models:
+            print(c("bold", "Available models:"))
+            for m in models:
+                print(f"  {m}")
+        else:
+            print(c("yellow", f"No models found or couldn't connect to {args.host}"))
+        return
+
+    if not args.model:
+        models = list_models(args.host)
+        if not models:
+            print(c("red", f"Error: No model specified and couldn't connect to Ollama at {args.host}"))
+            print(c("dim", "Set OLLAMA_MODEL env var, use -m <model>, or check that Ollama is running."))
+            sys.exit(1)
+        args.model = models[0]
+        print(c("dim", f"No model specified, using: {args.model}"))
+        print(c("dim", "Use -m <model> or set OLLAMA_MODEL to choose a different one.\n"))
+
+    chat_loop(
+        model=args.model,
+        system_prompt=args.system,
+        host=args.host,
+        stream=not args.no_stream,
+    )
+
+
+if __name__ == "__main__":
+    main()
