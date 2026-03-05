@@ -205,11 +205,13 @@ def list_models(host):
 
 
 def chat_loop(model, system_prompt, host, stream):
-    messages = []
+    cwd = os.getcwd()
+    system_parts = [f"Working directory: {cwd}"]
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+        system_parts.append(system_prompt)
+    messages = [{"role": "system", "content": "\n".join(system_parts)}]
 
-    print(c("bold", "ai") + c("dim", f" [{model}]"))
+    print(c("bold", "ai") + c("dim", f" [{model}] ") + c("dim", cwd))
     if system_prompt:
         preview = system_prompt[:60] + ("..." if len(system_prompt) > 60 else "")
         print(c("dim", f"System: {preview}"))
@@ -235,9 +237,10 @@ def chat_loop(model, system_prompt, host, stream):
                 break
 
             elif cmd == "/clear":
-                messages = []
+                system_parts = [f"Working directory: {cwd}"]
                 if system_prompt:
-                    messages.append({"role": "system", "content": system_prompt})
+                    system_parts.append(system_prompt)
+                messages = [{"role": "system", "content": "\n".join(system_parts)}]
                 print(c("dim", "Conversation cleared."))
 
             elif cmd == "/model":
