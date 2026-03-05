@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -74,6 +75,11 @@ def c(color, text):
     if sys.stdout.isatty():
         return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
     return text
+
+
+def _strip_think(text):
+    """Remove <think>...</think> blocks (qwen3 thinking mode)."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 def run_bash(command, confirm=False):
@@ -155,39 +161,102 @@ def chat_request(host, model, messages, tools, stream=True):
         with urllib.request.urlopen(req) as resp:
             if stream:
                 full_content = ""
+                all_tool_calls = []
                 final_message = {}
+                in_think = False
+                partial = ""  # holds incomplete tag fragment across chunks
                 prefix_printed = False
+
                 for line in resp:
                     if not line:
                         continue
                     chunk = json.loads(line.decode())
-                    content = chunk.get("message", {}).get("content", "")
-                    if content:
-                        if not prefix_printed:
-                            print(c("green", "AI: "), end="", flush=True)
-                            prefix_printed = True
-                        print(content, end="", flush=True)
-                        full_content += content
+                    msg = chunk.get("message", {})
+                    token = msg.get("content", "")
+
+                    if token:
+                        full_content += token
+                        work = partial + token
+                        partial = ""
+                        out = ""
+
+                        while work:
+                            if not in_think:
+                                idx = work.find("<think>")
+                                if idx == -1:
+                                    # Check if the tail could be a partial <think>
+                                    for n in range(len("<think>") - 1, 0, -1):
+                                        if work.endswith("<think>"[:n]):
+                                            partial = work[-n:]
+                                            work = work[:-n]
+                                            break
+                                    out += work
+                                    work = ""
+                                else:
+                                    out += work[:idx]
+                                    work = work[idx + len("<think>"):]
+                                    in_think = True
+                            else:
+                                idx = work.find("</think>")
+                                if idx == -1:
+                                    for n in range(len("</think>") - 1, 0, -1):
+                                        if work.endswith("</think>"[:n]):
+                                            partial = work[-n:]
+                                            work = work[:-n]
+                                            break
+                                    work = ""
+                                    break
+                                else:
+                                    work = work[idx + len("</think>"):]
+                                    in_think = False
+
+                        if out:
+                            if not prefix_printed:
+                                print(c("green", "AI: "), end="", flush=True)
+                                prefix_printed = True
+                            print(out, end="", flush=True)
+
+                    chunk_tools = msg.get("tool_calls", [])
+                    if chunk_tools:
+                        all_tool_calls.extend(chunk_tools)
+
                     if chunk.get("done"):
-                        final_message = chunk.get("message", {})
+                        final_message = msg
+                        done_tools = msg.get("tool_calls", [])
+                        if done_tools:
+                            all_tool_calls.extend(done_tools)
                         break
 
-                tool_calls = final_message.get("tool_calls", [])
-                if full_content:
+                if prefix_printed:
                     print()  # newline after streamed text
 
+                # Deduplicate tool calls (done chunk may repeat them)
+                seen, unique_tool_calls = set(), []
+                for tc in all_tool_calls:
+                    key = json.dumps(tc, sort_keys=True)
+                    if key not in seen:
+                        seen.add(key)
+                        unique_tool_calls.append(tc)
+
+                if not prefix_printed and not unique_tool_calls:
+                    print(c("yellow", "AI: (no response — try a model that supports tools, e.g. qwen3:4b)"))
+
+                display_content = _strip_think(full_content)
                 content = final_message.get("content", "") or full_content
                 assistant_msg = {"role": "assistant", "content": content}
-                if tool_calls:
-                    assistant_msg["tool_calls"] = tool_calls
-                return content, tool_calls, assistant_msg
+                if unique_tool_calls:
+                    assistant_msg["tool_calls"] = unique_tool_calls
+                return display_content, unique_tool_calls, assistant_msg
             else:
                 data = json.loads(resp.read().decode())
                 msg = data["message"]
                 tool_calls = msg.get("tool_calls", [])
-                if msg.get("content"):
-                    print(c("green", "AI: ") + msg["content"])
-                return msg.get("content", ""), tool_calls, msg
+                display = _strip_think(msg.get("content", ""))
+                if display:
+                    print(c("green", "AI: ") + display)
+                elif not tool_calls:
+                    print(c("yellow", "AI: (no response — try a model that supports tools, e.g. qwen3:4b)"))
+                return display, tool_calls, msg
 
     except urllib.error.URLError as e:
         print(c("red", f"\nError connecting to Ollama at {host}: {e}"))
@@ -325,10 +394,10 @@ Environment variables:
 
 Examples:
   ai                                    Start chat (auto-picks first available model)
-  ai -m llama3.2                        Use a specific model
+  ai -m qwen3:4b                        Use a specific model
   ai -s "You are a Linux expert"        Set a system prompt
   ai --list                             List available models
-  OLLAMA_MODEL=mistral ai               Set model via env var
+  OLLAMA_MODEL=qwen3:4b ai              Set model via env var
 """,
     )
     parser.add_argument(
