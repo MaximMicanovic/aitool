@@ -1,74 +1,80 @@
 # ai
 
-An interactive terminal chat tool powered by [Ollama](https://ollama.com). Talks to locally running models, streams responses in real time, and can read and edit files on your machine using bash tools.
+An interactive terminal chat tool powered by [Ollama](https://ollama.com). Talks to locally running models, streams responses in real time, and can read files, run commands, and search the web using built-in tools.
 
 ## Features
 
 - Streaming output — see the response as it generates
-- Tool calling — the AI can run bash commands to read and edit files
-- Confirmation prompt before any command that changes files
+- Thinking spinner that clears cleanly before output begins
+- Tool calling — the AI can run bash commands and search the web
+- Read-only commands run automatically; write commands ask for confirmation
+- Safe command whitelist — common read-only patterns never prompt
 - Working directory awareness — knows where you launched it from
-- `<think>` block filtering for reasoning models (qwen3, etc.)
+- Context save/load — resume sessions across restarts
+- `<think>` block filtering for reasoning models
+- Retry logic when the model produces no output
 - No external dependencies — only Python stdlib
 
 ## Requirements
 
 - Python 3.7+
 - [Ollama](https://ollama.com) running locally (`ollama serve`)
-- A model that supports tool calling (see below)
+- Any model that supports tool calling
 
 ## Installation
 
 ```bash
-# Clone or copy the repo
-git clone <your-repo-url> ~/python/ai
+git clone https://github.com/MaximMicanovic/aitool ~/.local/aitool
 
 # Add to PATH (add this to your ~/.zshrc or ~/.bashrc)
-export PATH="$HOME/python/ai:$PATH"
+export PATH="$HOME/.local/aitool:$PATH"
 
-# Reload your shell
 source ~/.zshrc
 ```
 
 ## Recommended Models
 
-Not all models support tool calling. These work well:
+Any Ollama model with tool calling support works. Some good options:
 
 | Model | Size | Notes |
 |---|---|---|
-| `qwen3:4b` | 4B | Good balance of speed and quality |
-| `qwen3:14b` | 14B | Better reasoning, slower |
-| `qwen3.5:9b-q8_0` | 9B | High quality quantized |
+| `qwen3.5:9b-q8_0` | 9B | Default — strong reasoning and tool use |
+| `qwen3:4b` | 4B | Faster, lighter |
+| `llama3.1:8b` | 8B | Good general purpose |
+| `mistral:7b` | 7B | Fast and capable |
 
 ```bash
-ollama pull qwen3:4b
+ollama pull qwen3.5:9b-q8_0
 ```
 
 ## Usage
 
 ```bash
-# Start with auto-selected model
+# Start with default model
 ai
 
 # Use a specific model
-ai -m qwen3:4b
+ai -m llama3.1:8b
 
-# Set a system prompt / persona
+# Set a system prompt
 ai -s "You are a senior Python developer"
+
+# Resume a previous session
+ai -l ai-context.json
 
 # List available models
 ai --list
 
-# Disable streaming (wait for full response)
+# Disable streaming
 ai --no-stream
 ```
 
 ### Environment Variables
 
 ```bash
-export OLLAMA_MODEL="qwen3:4b"         # default model
-export OLLAMA_HOST="http://localhost:11434"  # ollama URL (default)
-export OLLAMA_SYSTEM="You are a Linux expert"  # default system prompt
+export OLLAMA_MODEL="llama3.1:8b"
+export OLLAMA_HOST="http://localhost:11434"  # default
+export OLLAMA_SYSTEM="You are a Linux expert"
 ```
 
 ## In-Chat Commands
@@ -79,46 +85,55 @@ export OLLAMA_SYSTEM="You are a Linux expert"  # default system prompt
 | `/system [text]` | Show or update the system prompt |
 | `/clear` | Clear conversation history |
 | `/history` | Print the full conversation so far |
+| `/save [file]` | Save session to file (default: `ai-context.json`) |
+| `/load <file>` | Load a saved session |
 | `/help` | Show this list |
 | `/exit` | Quit |
 
 ## Tools
 
-The AI has access to two bash tools:
+The AI has access to three tools:
 
 ### `bash_read`
-Runs read-only commands automatically, without asking. Used for things like listing files, reading file contents, searching with grep, checking git status, etc.
+Runs read-only commands automatically without asking — listing files, reading content, searching with grep, checking git status, etc.
 
 ```
-  [read] ls -la
-  total 32
-  drwxr-xr-x  3 maxim maxim 4096 ...
-  ...
+  [read] find . -name "*.py"
+  ./main.py
+  ./utils/helpers.py
 ```
 
 ### `bash`
-Runs commands that modify files or system state. Always shows the command and asks for confirmation before running.
+Runs commands that modify files or system state. Shows the command and asks for confirmation first. Common read-only patterns (cat, head, tail, grep, git log, etc.) are whitelisted and skip the prompt even if the model uses this tool.
 
 ```
 Command to run:
   sed -i 's/old/new/' main.py
-Run? [y/N]
+Run? [Y/n]
+```
+
+### `web_search`
+Searches the web via DuckDuckGo and returns results. Runs automatically without confirmation.
+
+```
+  [search] Python subprocess timeout handling
+  Summary: ...
 ```
 
 ## Working Directory
 
-The AI is told your current working directory when it starts. Run it from inside your project and it will use relative paths correctly:
+The AI is told your current working directory at startup. Launch it from inside your project and it will use relative paths correctly:
 
 ```bash
 cd ~/projects/myapp
-ai -m qwen3:4b
+ai
 # AI knows it's working in ~/projects/myapp
 ```
 
 ## Example Session
 
 ```
-ai [qwen3:4b] /home/maxim/projects/myapp
+ai [qwen3.5:9b-q8_0] /home/user/projects/myapp
 
 You: what python files are in this project?
 
@@ -129,14 +144,13 @@ You: what python files are in this project?
 
 AI: There are 3 Python files: main.py, a helpers module in utils/, and a test file.
 
-You: there's a bug in main.py on line 12, can you fix it?
+You: there's a bug in main.py on line 12, fix it
 
-  [read] cat main.py
-  ...
+  [read] cat -n main.py
 
 Command to run:
   sed -i '12s/old_function/new_function/' main.py
-Run? [y/N] y
+Run? [Y/n] y
 
-AI: Fixed. The call on line 12 now uses `new_function` instead of `old_function`.
+AI: Fixed. Line 12 now calls `new_function` instead of `old_function`.
 ```
