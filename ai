@@ -14,6 +14,19 @@ import urllib.error
 
 DEFAULT_HOST = "http://localhost:11434"
 
+# Commands that are safe to run without confirmation even via the bash tool
+SAFE_COMMAND_PREFIXES = (
+    "cat ", "cat\n", "head ", "tail ", "less ", "more ",
+    "ls ", "ls\n", "ll ", "tree ", "find ",
+    "grep ", "rg ", "ag ", "awk ", "sed -n",
+    "git log", "git status", "git diff", "git show", "git branch",
+    "ps ", "ps\n", "df ", "du ", "top ", "htop",
+    "env", "echo ", "pwd", "which ", "whereis ",
+    "file ", "wc ", "sort ", "uniq ", "cut ", "tr ",
+    "curl -s", "curl --silent", "wget -q",
+    "python3 -c", "python -c", "node -e",
+)
+
 COLORS = {
     "reset": "\033[0m",
     "bold": "\033[1m",
@@ -51,6 +64,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web using DuckDuckGo and return a summary of results. "
+                "Use this to look up current information, documentation, errors, or anything online."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "bash",
             "description": (
                 "Run a bash command that may modify files or system state. "
@@ -71,6 +104,34 @@ TOOLS = [
         },
     },
 ]
+
+
+def web_search(query):
+    """Search DuckDuckGo and return text results."""
+    import urllib.parse
+    url = "https://api.duckduckgo.com/?q=" + urllib.parse.quote(query) + "&format=json&no_html=1&skip_disambig=1"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ai-cli/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        results = []
+        if data.get("AbstractText"):
+            results.append(f"Summary: {data['AbstractText']}")
+            if data.get("AbstractURL"):
+                results.append(f"Source: {data['AbstractURL']}")
+
+        for item in data.get("RelatedTopics", [])[:5]:
+            if isinstance(item, dict) and item.get("Text"):
+                results.append(f"- {item['Text']}")
+                if item.get("FirstURL"):
+                    results.append(f"  {item['FirstURL']}")
+
+        if not results:
+            return f"No results found for: {query}"
+        return "\n".join(results)
+    except Exception as e:
+        return f"[Search error: {e}]"
 
 
 def c(color, text):
@@ -102,14 +163,15 @@ class Spinner:
         return self
 
     def stop(self):
+        """Non-blocking stop: signal thread and clear line immediately."""
         if not self._stop.is_set():
             self._stop.set()
-            self._thread.join()
             if sys.stdout.isatty():
                 print("\r\033[K", end="", flush=True)
 
     def __exit__(self, *_):
         self.stop()
+        self._thread.join()  # clean up thread only after streaming is done
 
 
 def _strip_think(text):
@@ -117,7 +179,19 @@ def _strip_think(text):
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
+def _is_safe_command(command):
+    import shlex
+    # Split on && and | and ; and check each part
+    parts = re.split(r'&&|\||;', command)
+    return all(
+        any(part.strip().startswith(p) for p in SAFE_COMMAND_PREFIXES) or part.strip().startswith("cd ")
+        for part in parts if part.strip()
+    )
+
+
 def run_bash(command, confirm=False):
+    if confirm and _is_safe_command(command):
+        confirm = False  # auto-approve read-only commands
     if confirm:
         print(c("yellow", "\nCommand to run:"))
         print(c("bold", f"  {command}"))
@@ -164,16 +238,21 @@ def handle_tool_call(tool_call):
         result = run_bash(command, confirm=False)
     elif name == "bash":
         result = run_bash(command, confirm=True)
+    elif name == "web_search":
+        query = args.get("query", "")
+        print(c("dim", "  [search] ") + c("bold", query))
+        result = web_search(query)
     else:
         result = f"[Unknown tool: {name}]"
 
+    cancelled = result == "[Command cancelled by user]"
     lines = result.splitlines()
     preview = "\n".join(f"  {l}" for l in lines[:20])
     if len(lines) > 20:
         preview += f"\n  ... ({len(lines) - 20} more lines)"
     print(c("dim", preview))
     print()
-    return result
+    return result, cancelled
 
 
 def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
@@ -417,6 +496,7 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
                 print(c("bold", "Tools available to the AI:"))
                 print("  bash_read         Read-only commands — run automatically")
                 print("  bash              Commands that change things — asks you first")
+                print("  web_search        Search the web via DuckDuckGo")
 
             else:
                 print(c("yellow", f"Unknown command: {cmd}. Type /help for help."))
@@ -426,6 +506,8 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
         messages.append({"role": "user", "content": user_input})
 
         # Agentic loop: keep going while the model is calling tools
+        retry_count = 0
+        max_retries = 3
         while True:
             with Spinner() as spinner:
                 content, tool_calls, assistant_msg, failed_tool = chat_request(
@@ -442,19 +524,42 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
             messages.append(assistant_msg)
 
             if failed_tool:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    print(c("yellow", f"AI: (no response after {max_retries} attempts)"))
+                    break
+                print(c("dim", f"No response, retrying... ({retry_count}/{max_retries})"))
                 messages.append({
                     "role": "user",
                     "content": "It seems you didn't produce a response. Please continue.",
                 })
                 continue
 
+            retry_count = 0  # reset on successful response
+
             if not tool_calls:
                 break
 
             print()  # blank line before tool output
+            cancelled = False
             for tool_call in tool_calls:
-                result = handle_tool_call(tool_call)
+                result, was_cancelled = handle_tool_call(tool_call)
                 messages.append({"role": "tool", "content": result})
+                if was_cancelled:
+                    cancelled = True
+                    break
+
+            if cancelled:
+                try:
+                    follow_up = input(c("cyan", "You: ")).strip()
+                except (KeyboardInterrupt, EOFError):
+                    print(c("dim", "\nBye!"))
+                    return
+                if follow_up in ("/exit", "/quit", "/bye"):
+                    print(c("dim", "Bye!"))
+                    return
+                messages.append({"role": "user", "content": follow_up})
+                continue
 
 
 def main():
@@ -482,7 +587,7 @@ Examples:
     )
     parser.add_argument(
         "-s", "--system",
-        default=os.environ.get("OLLAMA_SYSTEM", ""),
+        default=os.environ.get("OLLAMA_SYSTEM", "When editing existing files, prefer targeted edits (sed, patch, line insertions) over full rewrites unless the change is large. After making changes, always verify them by running or testing the code to confirm it works correctly."),
         help="System prompt (or set OLLAMA_SYSTEM env var)",
     )
     parser.add_argument(
