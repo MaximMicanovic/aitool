@@ -9,22 +9,55 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 DEFAULT_HOST = "http://localhost:11434"
 
 # Commands that are safe to run without confirmation even via the bash tool
 SAFE_COMMAND_PREFIXES = (
-    "cat ", "cat\n", "head ", "tail ", "less ", "more ",
-    "ls ", "ls\n", "ll ", "tree ", "find ",
-    "grep ", "rg ", "ag ", "awk ", "sed -n",
-    "git log", "git status", "git diff", "git show", "git branch",
-    "ps ", "ps\n", "df ", "du ", "top ", "htop",
-    "env", "echo ", "pwd", "which ", "whereis ",
-    "file ", "wc ", "sort ", "uniq ", "cut ", "tr ",
-    "curl -s", "curl --silent", "wget -q",
-    "python3 -c", "python -c", "node -e",
+    "head ",
+    "tail ",
+    "less ",
+    "more ",
+    "ls ",
+    "ls\n",
+    "ll ",
+    "tree ",
+    "find ",
+    "grep ",
+    "rg ",
+    "ag ",
+    "awk ",
+    "sed -n",
+    "git log",
+    "git status",
+    "git diff",
+    "git show",
+    "git branch",
+    "ps ",
+    "ps\n",
+    "df ",
+    "du ",
+    "top ",
+    "htop",
+    "env",
+    "echo ",
+    "pwd",
+    "which ",
+    "whereis ",
+    "file ",
+    "wc ",
+    "sort ",
+    "uniq ",
+    "cut ",
+    "tr ",
+    "curl -s",
+    "curl --silent",
+    "wget -q",
+    "python3 -c",
+    "python -c",
+    "node -e",
 )
 
 COLORS = {
@@ -109,7 +142,12 @@ TOOLS = [
 def web_search(query):
     """Search DuckDuckGo and return text results."""
     import urllib.parse
-    url = "https://api.duckduckgo.com/?q=" + urllib.parse.quote(query) + "&format=json&no_html=1&skip_disambig=1"
+
+    url = (
+        "https://api.duckduckgo.com/?q="
+        + urllib.parse.quote(query)
+        + "&format=json&no_html=1&skip_disambig=1"
+    )
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "ai-cli/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -154,7 +192,9 @@ class Spinner:
         i = 0
         while not self._stop.is_set():
             frame = self._frames[i % len(self._frames)]
-            print(f"\r{c('dim', frame + ' ' + self._label + '...')}", end="", flush=True)
+            print(
+                f"\r{c('dim', frame + ' ' + self._label + '...')}", end="", flush=True
+            )
             i += 1
             time.sleep(0.08)
 
@@ -179,14 +219,50 @@ def _strip_think(text):
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
-def _is_safe_command(command):
+def _is_cat_command(command_part):
+    """Return True when a command segment starts with the cat command."""
+    return bool(re.match(r"^cat(?:\s|$)", command_part))
+
+
+def _has_output_redirection(command_part):
+    """Detect shell output redirection operators in a command segment."""
     import shlex
+
+    try:
+        lexer = shlex.shlex(command_part, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        # If parsing fails, play it safe and require confirmation.
+        return True
+
+    for token in tokens:
+        if token and set(token) <= set("<>|&") and ">" in token:
+            return True
+    return False
+
+
+def _is_safe_command(command):
     # Split on && and | and ; and check each part
-    parts = re.split(r'&&|\||;', command)
-    return all(
-        any(part.strip().startswith(p) for p in SAFE_COMMAND_PREFIXES) or part.strip().startswith("cd ")
-        for part in parts if part.strip()
-    )
+    parts = re.split(r"&&|\||;", command)
+    for raw_part in parts:
+        part = raw_part.strip()
+        if not part:
+            continue
+
+        if _is_cat_command(part):
+            if _has_output_redirection(part):
+                return False
+            continue
+
+        if any(part.startswith(p) for p in SAFE_COMMAND_PREFIXES) or part.startswith(
+            "cd "
+        ):
+            continue
+
+        return False
+
+    return True
 
 
 def run_bash(command, confirm=False):
@@ -235,7 +311,7 @@ def handle_tool_call(tool_call):
 
     if name == "bash_read":
         print(c("dim", "  [read] ") + c("bold", command))
-        result = run_bash(command, confirm=False)
+        result = run_bash(command, confirm=not _is_safe_command(command))
     elif name == "bash":
         result = run_bash(command, confirm=True)
     elif name == "web_search":
@@ -258,13 +334,15 @@ def handle_tool_call(tool_call):
 def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
     """Returns (content, tool_calls, assistant_message) or (None, None, None) on error."""
     url = f"{host}/api/chat"
-    payload = json.dumps({
-        "model": model,
-        "messages": messages,
-        "tools": tools,
-        "stream": stream,
-        "options": {"num_ctx": 65536},
-    }).encode()
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "stream": stream,
+            "options": {"num_ctx": 65536},
+        }
+    ).encode()
 
     req = urllib.request.Request(
         url,
@@ -309,7 +387,7 @@ def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
                                     work = ""
                                 else:
                                     out += work[:idx]
-                                    work = work[idx + len("<think>"):]
+                                    work = work[idx + len("<think>") :]
                                     in_think = True
                             else:
                                 idx = work.find("</think>")
@@ -322,7 +400,7 @@ def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
                                     work = ""
                                     break
                                 else:
-                                    work = work[idx + len("</think>"):]
+                                    work = work[idx + len("</think>") :]
                                     in_think = False
 
                         if out:
@@ -480,7 +558,12 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
                         messages = data["messages"]
                         if "model" in data:
                             model = data["model"]
-                        print(c("dim", f"Context loaded from: {arg} (model: {model}, {len(messages)} messages)"))
+                        print(
+                            c(
+                                "dim",
+                                f"Context loaded from: {arg} (model: {model}, {len(messages)} messages)",
+                            )
+                        )
                     except Exception as e:
                         print(c("red", f"Failed to load: {e}"))
 
@@ -490,13 +573,17 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
                 print("  /model [name]     Show or set the active model")
                 print("  /system [text]    Show or set the system prompt")
                 print("  /history          Print conversation history")
-                print("  /save [file]      Save context to file (default: ai-context.json)")
+                print(
+                    "  /save [file]      Save context to file (default: ai-context.json)"
+                )
                 print("  /load <file>      Load context from file")
                 print("  /exit             Quit")
                 print()
                 print(c("bold", "Tools available to the AI:"))
                 print("  bash_read         Read-only commands — run automatically")
-                print("  bash              Commands that change things — asks you first")
+                print(
+                    "  bash              Commands that change things — asks you first"
+                )
                 print("  web_search        Search the web via DuckDuckGo")
 
             else:
@@ -512,7 +599,11 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
         while True:
             with Spinner() as spinner:
                 content, tool_calls, assistant_msg, failed_tool = chat_request(
-                    host, model, messages, tools=TOOLS, stream=stream,
+                    host,
+                    model,
+                    messages,
+                    tools=TOOLS,
+                    stream=stream,
                     stop_spinner=spinner.stop,
                 )
 
@@ -527,13 +618,19 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
             if failed_tool:
                 retry_count += 1
                 if retry_count >= max_retries:
-                    print(c("yellow", f"AI: (no response after {max_retries} attempts)"))
+                    print(
+                        c("yellow", f"AI: (no response after {max_retries} attempts)")
+                    )
                     break
-                print(c("dim", f"No response, retrying... ({retry_count}/{max_retries})"))
-                messages.append({
-                    "role": "user",
-                    "content": "It seems you didn't produce a response. Please continue.",
-                })
+                print(
+                    c("dim", f"No response, retrying... ({retry_count}/{max_retries})")
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "It seems you didn't produce a response. Please continue.",
+                    }
+                )
                 continue
 
             retry_count = 0  # reset on successful response
@@ -582,13 +679,18 @@ Examples:
 """,
     )
     parser.add_argument(
-        "-m", "--model",
+        "-m",
+        "--model",
         default=os.environ.get("OLLAMA_MODEL", "qwen3.5:9b-q8_0"),
         help="Model to use (or set OLLAMA_MODEL env var)",
     )
     parser.add_argument(
-        "-s", "--system",
-        default=os.environ.get("OLLAMA_SYSTEM", "When editing existing files, prefer targeted edits (sed, patch, line insertions) over full rewrites unless the change is large. After making changes, always verify them by running or testing the code to confirm it works correctly."),
+        "-s",
+        "--system",
+        default=os.environ.get(
+            "OLLAMA_SYSTEM",
+            "When editing existing files, prefer targeted edits (sed, patch, line insertions) over full rewrites unless the change is large. After making changes, always verify them by running or testing the code to confirm it works correctly.",
+        ),
         help="System prompt (or set OLLAMA_SYSTEM env var)",
     )
     parser.add_argument(
@@ -607,7 +709,8 @@ Examples:
         help="List available models and exit",
     )
     parser.add_argument(
-        "-l", "--load",
+        "-l",
+        "--load",
         metavar="FILE",
         help="Load a saved context file to resume a previous session",
     )

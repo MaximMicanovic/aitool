@@ -95,7 +95,7 @@ export OLLAMA_SYSTEM="You are a Linux expert"
 The AI has access to three tools:
 
 ### `bash_read`
-Runs read-only commands automatically without asking — listing files, reading content, searching with grep, checking git status, etc.
+Runs read-only commands automatically without asking — listing files, reading content, searching with grep, checking git status, etc. If a command looks non-read-only (for example `cat > file.txt`), it is treated as unsafe and asks for confirmation.
 
 ```
   [read] find . -name "*.py"
@@ -104,7 +104,7 @@ Runs read-only commands automatically without asking — listing files, reading 
 ```
 
 ### `bash`
-Runs commands that modify files or system state. Shows the command and asks for confirmation first. Common read-only patterns (cat, head, tail, grep, git log, etc.) are whitelisted and skip the prompt even if the model uses this tool.
+Runs commands that modify files or system state. Shows the command and asks for confirmation first. Common read-only patterns (head, tail, grep, git log, etc.) are whitelisted and skip the prompt even if the model uses this tool. `cat` is auto-approved only for read usage (for example `cat file.txt`); `cat` with output redirection (for example `cat > file.txt`) requires confirmation.
 
 ```
 Command to run:
