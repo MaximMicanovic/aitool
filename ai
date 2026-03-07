@@ -349,7 +349,7 @@ def handle_tool_call(tool_call):
     return result, cancelled
 
 
-def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
+def chat_request(host, model, messages, tools, stream=True, stop_spinner=None, label="AI"):
     """Returns (content, tool_calls, assistant_message) or (None, None, None) on error."""
     url = f"{host}/api/chat"
     payload = json.dumps(
@@ -425,7 +425,7 @@ def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
                             if not prefix_printed:
                                 if stop_spinner:
                                     stop_spinner()
-                                print(c("green", "AI: "), end="", flush=True)
+                                print(c("green", f"{label}: "), end="", flush=True)
                                 prefix_printed = True
                             print(out, end="", flush=True)
 
@@ -465,7 +465,7 @@ def chat_request(host, model, messages, tools, stream=True, stop_spinner=None):
                 tool_calls = msg.get("tool_calls", [])
                 display = _strip_think(msg.get("content", ""))
                 if display:
-                    print(c("green", "AI: ") + display)
+                    print(c("green", f"{label}: ") + display)
                 failed_tool = not display and not tool_calls
                 return display, tool_calls, msg, failed_tool
 
@@ -615,15 +615,22 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
         retry_count = 0
         max_retries = 3
         while True:
-            with Spinner() as spinner:
-                content, tool_calls, assistant_msg, failed_tool = chat_request(
-                    host,
-                    model,
-                    messages,
-                    tools=TOOLS,
-                    stream=stream,
-                    stop_spinner=spinner.stop,
-                )
+            try:
+                with Spinner() as spinner:
+                    content, tool_calls, assistant_msg, failed_tool = chat_request(
+                        host,
+                        model,
+                        messages,
+                        tools=TOOLS,
+                        stream=stream,
+                        stop_spinner=spinner.stop,
+                        label=model,
+                    )
+            except KeyboardInterrupt:
+                print(c("dim", "\n[cancelled]"))
+                if messages and messages[-1]["role"] == "user":
+                    messages.pop()
+                break
 
             if assistant_msg is None:
                 # Connection error — remove the user message we just added
