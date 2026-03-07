@@ -243,10 +243,28 @@ def _has_output_redirection(command_part):
 
 
 def _is_safe_command(command):
-    # Split on && and | and ; and check each part
-    parts = re.split(r"&&|\||;", command)
-    for raw_part in parts:
-        part = raw_part.strip()
+    # Tokenize with shlex so | inside quoted strings isn't treated as a pipe
+    import shlex
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+
+    # Split token stream into segments on shell control operators
+    segments = []
+    current = []
+    for tok in tokens:
+        if tok in ("&&", "||", "|", ";"):
+            segments.append(" ".join(current))
+            current = []
+        else:
+            current.append(tok)
+    segments.append(" ".join(current))
+
+    for part in segments:
+        part = part.strip()
         if not part:
             continue
 
