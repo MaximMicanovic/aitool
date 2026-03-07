@@ -451,6 +451,9 @@ def chat_request(host, model, messages, tools, stream=True, stop_spinner=None, l
                         seen.add(key)
                         unique_tool_calls.append(tc)
 
+                for tc in unique_tool_calls:
+                    if not tc["function"].get("arguments"):
+                        tc["function"]["arguments"] = "{}"
                 failed_tool = not prefix_printed and not unique_tool_calls
 
                 display_content = _strip_think(full_content)
@@ -610,6 +613,7 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
             continue
 
         messages.append({"role": "user", "content": user_input})
+        user_msg_idx = len(messages) - 1
 
         # Agentic loop: keep going while the model is calling tools
         retry_count = 0
@@ -665,12 +669,17 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
 
             print()  # blank line before tool output
             cancelled = False
-            for tool_call in tool_calls:
-                result, was_cancelled = handle_tool_call(tool_call)
-                messages.append({"role": "tool", "content": result})
-                if was_cancelled:
-                    cancelled = True
-                    break
+            try:
+                for tool_call in tool_calls:
+                    result, was_cancelled = handle_tool_call(tool_call)
+                    messages.append({"role": "tool", "content": result})
+                    if was_cancelled:
+                        cancelled = True
+                        break
+            except KeyboardInterrupt:
+                del messages[user_msg_idx:]
+                print(c("dim", "\n[cancelled]"))
+                break
 
             if cancelled:
                 try:
