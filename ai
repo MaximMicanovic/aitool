@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ai - Interactive chat tool powered by Ollama"""
+"""ai - Interactive chat tool for local model backends."""
 
 import argparse
 import json
@@ -11,9 +11,8 @@ import time
 import urllib.error
 import urllib.request
 
+from startup import startup_sequence
 from tools import TOOLS, handle_tool_call
-
-DEFAULT_HOST = "http://localhost:11434"
 
 COLORS = {
     "reset": "\033[0m",
@@ -73,18 +72,39 @@ def _strip_think(text):
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
-def chat_request(host, model, messages, tools, stream=True, stop_spinner=None, label="AI"):
-    """Returns (content, tool_calls, assistant_message) or (None, None, None) on error."""
-    url = f"{host}/api/chat"
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "stream": stream,
-            "options": {"num_ctx": 65536},
-        }
-    ).encode()
+def chat_request(
+    host,
+    model,
+    messages,
+    tools,
+    stream=True,
+    stop_spinner=None,
+    label="AI",
+    provider="ollama",
+):
+    """Returns (content, tool_calls, assistant_message, failed_tool, response_model)."""
+    if provider == "lmstudio":
+        # LM Studio exposes an OpenAI-compatible chat endpoint.
+        url = f"{host}/v1/chat/completions"
+        payload = json.dumps(
+            {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "stream": stream,
+            }
+        ).encode()
+    else:
+        url = f"{host}/api/chat"
+        payload = json.dumps(
+            {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "stream": stream,
+                "options": {"num_ctx": 65536},
+            }
+        ).encode()
 
     req = urllib.request.Request(
         url,
@@ -96,114 +116,254 @@ def chat_request(host, model, messages, tools, stream=True, stop_spinner=None, l
         with urllib.request.urlopen(req) as resp:
             if stream:
                 full_content = ""
-                all_tool_calls = []
-                final_message = {}
+                response_model = None
                 in_think = False
                 partial = ""  # holds incomplete tag fragment across chunks
                 prefix_printed = False
 
-                for line in resp:
-                    if not line:
-                        continue
-                    chunk = json.loads(line.decode())
-                    msg = chunk.get("message", {})
-                    token = msg.get("content", "")
+                if provider == "lmstudio":
+                    # OpenAI-style SSE streaming.
+                    tool_buffers = {}
 
-                    if token:
-                        full_content += token
-                        work = partial + token
-                        partial = ""
-                        out = ""
+                    for raw_line in resp:
+                        if not raw_line:
+                            continue
+                        line = raw_line.decode(errors="ignore").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
 
-                        while work:
-                            if not in_think:
-                                idx = work.find("<think>")
-                                if idx == -1:
-                                    # Check if the tail could be a partial <think>
-                                    for n in range(len("<think>") - 1, 0, -1):
-                                        if work.endswith("<think>"[:n]):
-                                            partial = work[-n:]
-                                            work = work[:-n]
-                                            break
-                                    out += work
-                                    work = ""
+                        data_part = line[len("data:") :].strip()
+                        if data_part == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data_part)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if not response_model:
+                            response_model = chunk.get("model")
+
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        token = delta.get("content", "")
+
+                        if token:
+                            full_content += token
+                            work = partial + token
+                            partial = ""
+                            out = ""
+
+                            while work:
+                                if not in_think:
+                                    idx = work.find("<think>")
+                                    if idx == -1:
+                                        # Check if the tail could be a partial <think>
+                                        for n in range(len("<think>") - 1, 0, -1):
+                                            if work.endswith("<think>"[:n]):
+                                                partial = work[-n:]
+                                                work = work[:-n]
+                                                break
+                                        out += work
+                                        work = ""
+                                    else:
+                                        out += work[:idx]
+                                        work = work[idx + len("<think>") :]
+                                        in_think = True
                                 else:
-                                    out += work[:idx]
-                                    work = work[idx + len("<think>") :]
-                                    in_think = True
-                            else:
-                                idx = work.find("</think>")
-                                if idx == -1:
-                                    for n in range(len("</think>") - 1, 0, -1):
-                                        if work.endswith("</think>"[:n]):
-                                            partial = work[-n:]
-                                            work = work[:-n]
-                                            break
-                                    work = ""
-                                    break
+                                    idx = work.find("</think>")
+                                    if idx == -1:
+                                        for n in range(len("</think>") - 1, 0, -1):
+                                            if work.endswith("</think>"[:n]):
+                                                partial = work[-n:]
+                                                work = work[:-n]
+                                                break
+                                        work = ""
+                                        break
+                                    else:
+                                        work = work[idx + len("</think>") :]
+                                        in_think = False
+
+                            if out:
+                                if not prefix_printed:
+                                    if stop_spinner:
+                                        stop_spinner()
+                                    print(
+                                        c("green", f"{response_model or label}: "),
+                                        end="",
+                                        flush=True,
+                                    )
+                                    prefix_printed = True
+                                print(out, end="", flush=True)
+
+                        for tc in delta.get("tool_calls", []):
+                            idx = tc.get("index", 0)
+                            if idx not in tool_buffers:
+                                tool_buffers[idx] = {
+                                    "id": tc.get("id", ""),
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            entry = tool_buffers[idx]
+                            if tc.get("id"):
+                                entry["id"] = tc["id"]
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                entry["function"]["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                entry["function"]["arguments"] += fn["arguments"]
+
+                    if prefix_printed:
+                        print()  # newline after streamed text
+
+                    tool_calls = [tool_buffers[k] for k in sorted(tool_buffers)]
+                    for tc in tool_calls:
+                        if not tc["function"].get("arguments"):
+                            tc["function"]["arguments"] = "{}"
+
+                    failed_tool = not prefix_printed and not tool_calls
+                    display_content = _strip_think(full_content)
+                    assistant_msg = {"role": "assistant", "content": full_content}
+                    if tool_calls:
+                        assistant_msg["tool_calls"] = tool_calls
+                    return (
+                        display_content,
+                        tool_calls,
+                        assistant_msg,
+                        failed_tool,
+                        response_model,
+                    )
+                else:
+                    all_tool_calls = []
+                    final_message = {}
+
+                    for line in resp:
+                        if not line:
+                            continue
+                        chunk = json.loads(line.decode())
+                        if not response_model:
+                            response_model = chunk.get("model")
+                        msg = chunk.get("message", {})
+                        token = msg.get("content", "")
+
+                        if token:
+                            full_content += token
+                            work = partial + token
+                            partial = ""
+                            out = ""
+
+                            while work:
+                                if not in_think:
+                                    idx = work.find("<think>")
+                                    if idx == -1:
+                                        # Check if the tail could be a partial <think>
+                                        for n in range(len("<think>") - 1, 0, -1):
+                                            if work.endswith("<think>"[:n]):
+                                                partial = work[-n:]
+                                                work = work[:-n]
+                                                break
+                                        out += work
+                                        work = ""
+                                    else:
+                                        out += work[:idx]
+                                        work = work[idx + len("<think>") :]
+                                        in_think = True
                                 else:
-                                    work = work[idx + len("</think>") :]
-                                    in_think = False
+                                    idx = work.find("</think>")
+                                    if idx == -1:
+                                        for n in range(len("</think>") - 1, 0, -1):
+                                            if work.endswith("</think>"[:n]):
+                                                partial = work[-n:]
+                                                work = work[:-n]
+                                                break
+                                        work = ""
+                                        break
+                                    else:
+                                        work = work[idx + len("</think>") :]
+                                        in_think = False
 
-                        if out:
-                            if not prefix_printed:
-                                if stop_spinner:
-                                    stop_spinner()
-                                print(c("green", f"{label}: "), end="", flush=True)
-                                prefix_printed = True
-                            print(out, end="", flush=True)
+                            if out:
+                                if not prefix_printed:
+                                    if stop_spinner:
+                                        stop_spinner()
+                                    print(
+                                        c("green", f"{response_model or label}: "),
+                                        end="",
+                                        flush=True,
+                                    )
+                                    prefix_printed = True
+                                print(out, end="", flush=True)
 
-                    chunk_tools = msg.get("tool_calls", [])
-                    if chunk_tools:
-                        all_tool_calls.extend(chunk_tools)
+                        chunk_tools = msg.get("tool_calls", [])
+                        if chunk_tools:
+                            all_tool_calls.extend(chunk_tools)
 
-                    if chunk.get("done"):
-                        final_message = msg
-                        done_tools = msg.get("tool_calls", [])
-                        if done_tools:
-                            all_tool_calls.extend(done_tools)
-                        break
+                        if chunk.get("done"):
+                            final_message = msg
+                            done_tools = msg.get("tool_calls", [])
+                            if done_tools:
+                                all_tool_calls.extend(done_tools)
+                            break
 
-                if prefix_printed:
-                    print()  # newline after streamed text
+                    if prefix_printed:
+                        print()  # newline after streamed text
 
-                # Deduplicate tool calls (done chunk may repeat them)
-                seen, unique_tool_calls = set(), []
-                for tc in all_tool_calls:
-                    key = json.dumps(tc, sort_keys=True)
-                    if key not in seen:
-                        seen.add(key)
-                        unique_tool_calls.append(tc)
+                    # Deduplicate tool calls (done chunk may repeat them)
+                    seen, unique_tool_calls = set(), []
+                    for tc in all_tool_calls:
+                        key = json.dumps(tc, sort_keys=True)
+                        if key not in seen:
+                            seen.add(key)
+                            unique_tool_calls.append(tc)
 
-                for tc in unique_tool_calls:
-                    if not tc["function"].get("arguments"):
-                        tc["function"]["arguments"] = "{}"
-                failed_tool = not prefix_printed and not unique_tool_calls
+                    for tc in unique_tool_calls:
+                        if not tc["function"].get("arguments"):
+                            tc["function"]["arguments"] = "{}"
+                    failed_tool = not prefix_printed and not unique_tool_calls
 
-                display_content = _strip_think(full_content)
-                content = final_message.get("content", "") or full_content
-                assistant_msg = {"role": "assistant", "content": content}
-                if unique_tool_calls:
-                    assistant_msg["tool_calls"] = unique_tool_calls
-                return display_content, unique_tool_calls, assistant_msg, failed_tool
+                    display_content = _strip_think(full_content)
+                    content = final_message.get("content", "") or full_content
+                    assistant_msg = {"role": "assistant", "content": content}
+                    if unique_tool_calls:
+                        assistant_msg["tool_calls"] = unique_tool_calls
+                    return (
+                        display_content,
+                        unique_tool_calls,
+                        assistant_msg,
+                        failed_tool,
+                        response_model,
+                    )
             else:
                 data = json.loads(resp.read().decode())
-                msg = data["message"]
+                if provider == "lmstudio":
+                    choices = data.get("choices", [])
+                    msg = choices[0].get("message", {}) if choices else {}
+                    response_model = data.get("model")
+                else:
+                    msg = data["message"]
+                    response_model = data.get("model")
                 tool_calls = msg.get("tool_calls", [])
                 display = _strip_think(msg.get("content", ""))
                 if display:
-                    print(c("green", f"{label}: ") + display)
+                    if stop_spinner:
+                        stop_spinner()
+                    print(c("green", f"{response_model or label}: ") + display)
                 failed_tool = not display and not tool_calls
-                return display, tool_calls, msg, failed_tool
+                return display, tool_calls, msg, failed_tool, response_model
 
     except urllib.error.URLError as e:
-        print(c("red", f"\nError connecting to Ollama at {host}: {e}"))
-        print(c("dim", "Is Ollama running? Try: ollama serve"))
-        return None, None, None, False
+        print(c("red", f"\nError connecting to backend at {host}: {e}"))
+        return None, None, None, False, None
 
 
-def list_models(host):
+def list_models(host, provider="ollama"):
     try:
+        if provider == "lmstudio":
+            with urllib.request.urlopen(f"{host}/v1/models") as resp:
+                data = json.loads(resp.read().decode())
+                return [m["id"] for m in data.get("data", []) if "id" in m]
         with urllib.request.urlopen(f"{host}/api/tags") as resp:
             data = json.loads(resp.read().decode())
             return [m["name"] for m in data.get("models", [])]
@@ -211,7 +371,51 @@ def list_models(host):
         return []
 
 
-def handle_slash_command(user_input, model, system_prompt, messages, cwd, host):
+def resolve_boot_model_name(requested_model, host, provider):
+    """Resolve the startup model label from backend metadata when possible."""
+    models = list_models(host, provider=provider)
+    if not models:
+        return requested_model
+    if requested_model in models:
+        return requested_model
+    base = requested_model.split(":", 1)[0].strip().lower()
+    if base:
+        matches = [m for m in models if base in m.lower()]
+        if len(matches) == 1:
+            return matches[0]
+    if len(models) == 1:
+        return models[0]
+    return requested_model
+
+
+def select_model_interactively(models, current_model=None):
+    """Ask user to choose a model from available options."""
+    current_model = current_model if current_model in models else None
+    print(c("bold", "Available models:"))
+    for i, name in enumerate(models, 1):
+        marker = " (current)" if current_model and name == current_model else ""
+        print(f"  {i}. {name}{marker}")
+
+    while True:
+        prompt = "Select model by number or name: "
+        try:
+            choice = input(c("cyan", prompt)).strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return current_model or models[0]
+
+        if not choice:
+            return current_model or models[0]
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(models):
+                return models[idx - 1]
+        if choice in models:
+            return choice
+        print(c("yellow", "Invalid selection. Please try again."))
+
+
+def handle_slash_command(user_input, model, system_prompt, messages, cwd, host, provider):
     parts = user_input.split(None, 1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
@@ -231,7 +435,7 @@ def handle_slash_command(user_input, model, system_prompt, messages, cwd, host):
             model = arg
             print(c("dim", f"Model set to: {model}"))
         else:
-            available = list_models(host)
+            available = list_models(host, provider=provider)
             print(c("dim", f"Current model: {model}"))
             if available:
                 print(c("dim", "Available: " + ", ".join(available)))
@@ -297,7 +501,7 @@ def handle_slash_command(user_input, model, system_prompt, messages, cwd, host):
     return model, system_prompt, messages, False
 
 
-def chat_loop(model, system_prompt, host, stream, preload_messages=None):
+def chat_loop(model, system_prompt, host, stream, preload_messages=None, provider="ollama"):
     cwd = os.getcwd()
     system_parts = [f"Working directory: {cwd}"]
     if system_prompt:
@@ -310,7 +514,10 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
     else:
         messages = [{"role": "system", "content": "\n".join(system_parts)}]
 
-    print(c("bold", "ai") + c("dim", f" [{model}] ") + c("dim", cwd))
+    boot_model_name = resolve_boot_model_name(model, host, provider)
+    print(c("bold", "ai") + c("dim", f" [{boot_model_name}] ") + c("dim", cwd))
+    backend_label = "LM Studio" if provider == "lmstudio" else "Ollama"
+    print(c("dim", f"Backend: {backend_label} ({host})"))
     if system_prompt:
         preview = system_prompt[:60] + ("..." if len(system_prompt) > 60 else "")
         print(c("dim", f"System: {preview}"))
@@ -334,6 +541,7 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
                 messages=messages,
                 cwd=cwd,
                 host=host,
+                provider=provider,
             )
             if should_exit:
                 break
@@ -348,7 +556,7 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
         while True:
             try:
                 with Spinner() as spinner:
-                    content, tool_calls, assistant_msg, failed_tool = chat_request(
+                    content, tool_calls, assistant_msg, failed_tool, _ = chat_request(
                         host,
                         model,
                         messages,
@@ -356,6 +564,7 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
                         stream=stream,
                         stop_spinner=spinner.stop,
                         label=model,
+                        provider=provider,
                     )
             except KeyboardInterrupt:
                 print(c("dim", "\n[cancelled]"))
@@ -423,12 +632,13 @@ def chat_loop(model, system_prompt, host, stream, preload_messages=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Interactive AI chat powered by Ollama",
+        description="Interactive AI chat for local backends (Ollama/LM Studio)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Environment variables:
-  OLLAMA_MODEL   Default model to use
-  OLLAMA_HOST    Ollama server URL (default: http://localhost:11434)
+  OLLAMA_HOST    Ollama server URL (default on Linux: http://localhost:11434)
+  LM_STUDIO_HOST LM Studio URL (default on WSL: http://192.168.1.56:1234)
+  AI_PROVIDER    Force provider: ollama or lmstudio
   OLLAMA_SYSTEM  Default system prompt
 
 Examples:
@@ -436,14 +646,13 @@ Examples:
   ai -m qwen3.5:9b-q8_0                 Use a specific model
   ai -s "You are a Linux expert"        Set a system prompt
   ai --list                             List available models
-  OLLAMA_MODEL=qwen3.5:9b-q8_0 ai       Set model via env var
 """,
     )
     parser.add_argument(
         "-m",
         "--model",
-        default=os.environ.get("OLLAMA_MODEL", "qwen3.5:9b-q8_0"),
-        help="Model to use (or set OLLAMA_MODEL env var)",
+        default=None,
+        help="Model to use",
     )
     parser.add_argument(
         "-s",
@@ -456,8 +665,8 @@ Examples:
     )
     parser.add_argument(
         "--host",
-        default=os.environ.get("OLLAMA_HOST", DEFAULT_HOST),
-        help="Ollama host URL (default: http://localhost:11434)",
+        default=None,
+        help="Backend host URL (auto-detected by startup sequence if omitted)",
     )
     parser.add_argument(
         "--no-stream",
@@ -477,15 +686,31 @@ Examples:
     )
 
     args = parser.parse_args()
+    startup = startup_sequence(args.host)
+    args.host = startup.host
+    available_models = list_models(args.host, provider=startup.provider)
 
     if args.list:
-        models = list_models(args.host)
-        if models:
+        if available_models:
             print(c("bold", "Available models:"))
-            for m in models:
+            for m in available_models:
                 print(f"  {m}")
         else:
             print(c("yellow", f"No models found or couldn't connect to {args.host}"))
+        return
+
+    if available_models:
+        if len(available_models) == 1:
+            args.model = available_models[0]
+        elif not args.model or args.model not in available_models:
+            if sys.stdin.isatty():
+                args.model = select_model_interactively(
+                    available_models, current_model=args.model
+                )
+            else:
+                args.model = available_models[0]
+    elif not args.model:
+        print(c("yellow", "No model configured and no models detected from backend."))
         return
 
     preload_messages = None
@@ -506,6 +731,7 @@ Examples:
         host=args.host,
         stream=not args.no_stream,
         preload_messages=preload_messages,
+        provider=startup.provider,
     )
 
 
